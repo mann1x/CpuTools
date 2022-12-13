@@ -81,21 +81,6 @@ typedef BOOL(WINAPI* LPFN_GLPI)(
 	PSYSTEM_LOGICAL_PROCESSOR_INFORMATION,
 	PDWORD);
 
-extern "C" BOOL APIENTRY DllMain( HMODULE hModule,
-                       DWORD  ul_reason_for_call,
-                       LPVOID lpReserved
-                     )
-{
-    switch (ul_reason_for_call)
-    {
-    case DLL_PROCESS_ATTACH:
-    case DLL_THREAD_ATTACH:
-    case DLL_THREAD_DETACH:
-    case DLL_PROCESS_DETACH:
-        break;
-    }
-    return TRUE;
-}
 
 // TIME DIFF FUNC
 ULONGLONG SubtractTimes(const FILETIME one, const FILETIME two)
@@ -397,148 +382,155 @@ int _RunBoostTestLegacy(int thread, int quick)
 	return counter;
 }
 
-
-
-class CLooper
+BOOLEAN WINAPI CpuToolsDllMain(IN HINSTANCE hDllHandle,
+	IN DWORD nReason,
+	IN LPVOID Reserved)
 {
-	private: // Members
-		std::atomic_bool mRunning;
-
-	private:
-		std::thread mThread;
-
-	private:
-		std::atomic_bool mAbortRequested;
-
-	private:
-		std::recursive_mutex mRunnablesMutex;
-
-	public:
-		using Runnable = std::function<void()>;
-
-		class CDispatcher
+	switch (nReason)
+	{
+	case DLL_PROCESS_ATTACH:
 		{
-			friend class CLooper; // Allow the looper to access the private constructor.
+			break;
+		}
+	case DLL_PROCESS_DETACH:
+		{
+			break;
+		}
+	}
 
-			public:
-				bool post(CLooper::Runnable&& aRunnable)
-				{
-					return mAssignedLooper.post(std::move(aRunnable));
-				}
+	return TRUE;
+}
 
-			private: // construction, since we want the looper to expose it's dispatcher exclusively!
-				CDispatcher(CLooper& aLooper)
-					: mAssignedLooper(aLooper)
-					, mDispatcher(std::shared_ptr<CDispatcher>(new CDispatcher(*this)))
-				{}
+extern "C" BOOL APIENTRY DllMain(HMODULE hModule,
+	DWORD  ul_reason_for_call,
+	LPVOID lpReserved
+)
+{
+	BOOLEAN bSuccess = TRUE;
 
-			private:
-				// Store a reference to the attached looper in order to 
-				// emplace tasks into the queue.
-				CLooper& mAssignedLooper;
+	switch (ul_reason_for_call)
+	{
+	case DLL_PROCESS_ATTACH:
+		DisableThreadLibraryCalls(hModule);
+		break;
+	case DLL_PROCESS_DETACH:
+		break;
+	}
 
-		private: // Members
-				std::shared_ptr<CDispatcher> mDispatcher;
 
-		public:
-			std::shared_ptr<CDispatcher> getDispatcher()
-			{
-				return mDispatcher;
+	if (CpuToolsDllMain(hModule, ul_reason_for_call, lpReserved))
+	{
+		bSuccess = TRUE;
+	}
+	else
+	{
+		bSuccess = FALSE;
+	}
+
+	return bSuccess;
+}
+
+BOOL SetPrivilege(HANDLE hToken, PCTSTR lpszPrivilege, bool bEnablePrivilege) {
+	TOKEN_PRIVILEGES tp;
+	LUID luid;
+
+	if (!::LookupPrivilegeValue(nullptr, lpszPrivilege, &luid))
+		return FALSE;
+
+	tp.PrivilegeCount = 1;
+	tp.Privileges[0].Luid = luid;
+	if (bEnablePrivilege)
+		tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+	else
+		tp.Privileges[0].Attributes = 0;
+
+	// Enable the privilege or disable all privileges.
+
+	if (!::AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), nullptr, nullptr)) {
+		return FALSE;
+	}
+
+	if (::GetLastError() == ERROR_NOT_ALL_ASSIGNED)
+		return FALSE;
+
+	return TRUE;
+}
+
+template<typename T>
+//bool ParseCPUSet(T* pSet, const char* text, int& count) {
+bool ParseCPUSet(T* pSet, const UINT bitMask, int& count) {
+	/*
+	if (*text == '\0')
+		return true;
+	bool hex = false;
+	if (strlen(text) > 2 && (::strncmp(text, "0x", 2) == 0 || ::strncmp(text, "0X", 2) == 0))
+		hex = true;
+
+	int value = std::stoi(std::string(text + (hex ? 2 : 0)), nullptr, hex ? 16 : 10);
+	*/
+	pSet[0] = bitMask;
+	count = 1;
+	return true;
+}
+
+extern "C"
+{
+	__declspec(dllexport) int __stdcall SetSystemCpuSet(UINT bitMask)
+	{
+		ULONG64 systemCpuSet[20];
+		int count = 0;
+		int _ret = 0;
+		HANDLE hToken = nullptr;
+		NTSTATUS status;
+
+		::OpenProcessToken(::GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
+
+		if (!SetPrivilege(hToken, SE_INC_BASE_PRIORITY_NAME, TRUE))
+			_ret = -1;
+		::CloseHandle(hToken);
+
+		if (_ret == 0)
+			if (!ParseCPUSet(systemCpuSet, bitMask, count))
+				_ret = -2;
+
+		if (_ret == 0) {
+			auto pSet = systemCpuSet;
+
+			if (bitMask == 0) {
+				pSet = nullptr;
+				count = 0;
 			}
-		};
 
-	public:
-		CLooper()
-		{ }
-		// Copy denied, Move to be implemented
+			status = ::NtSetSystemInformation(SystemAllowedCpuSetsInformation, pSet, count * sizeof(ULONG64));
 
-	public: // Ctor/Dtor
-		~CLooper()
-		{
-			abortAndJoin();
+			if (status == STATUS_SUCCESS)
+				_ret = 0;
+			else
+				_ret = (int)status;
+
+		}
+
+		return _ret;
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) double __stdcall GetCpuTotalLoad()
+	{
+		static PDH_HQUERY cpuQuery;
+		static PDH_HCOUNTER cpuTotal;
+		PdhOpenQuery(NULL, NULL, &cpuQuery);
+		// You can also use L"\\Processor(*)\\% Processor Time" and get individual CPU values with PdhGetFormattedCounterArray()
+		PdhAddEnglishCounter(cpuQuery, L"\\Processor(_Total)\\% Processor Time", NULL, &cpuTotal);
+		PdhCollectQueryData(cpuQuery);
+		PDH_FMT_COUNTERVALUE counterVal;
+		
+		for (int count = 0; count <= 3; count++) {
+			PdhCollectQueryData(cpuQuery);
 		}
 		
-		// To be called, once the looper should start looping.
-		bool run()
-		{
-			try
-			{
-				mThread = std::thread(&CLooper::runFunc, this);
-			}
-			catch (...)
-			{
-				return false;
-			}
-
-			return true;
-		}
-
-	public: // Methods
-		bool running() const
-		{
-			return mRunning.load();
-		}
-
-	private: // Methods
-		// Conditionally-infinite loop doing sth. iteratively
-		void runFunc()
-		{
-			mRunning.store(true);
-
-			// We now check against abort criteria
-			while (false == mAbortRequested.load())
-			{
-				try
-				{
-					// Do something...
-				}
-				catch (std::runtime_error& e)
-				{
-					// Some more specific
-				}
-				catch (...)
-				{
-					// Make sure that nothing leaves the thread for now...
-				}
-			}
-
-			mRunning.store(false);
-		}
-
-		// Shared implementation of exiting the loop-function and joining 
-		// to the main thread.
-		void abortAndJoin()
-		{
-			mAbortRequested.store(true);
-			if (mThread.joinable())
-			{
-				mThread.join();
-			}
-		}
-
-	private:
-		bool post(Runnable&& aRunnable)
-		{
-			if (not running())
-			{
-				// Deny insertion
-				return false;
-			}
-
-			try
-			{
-				std::lock_guard guard(mRunnablesMutex); // CTAD, C++17
-
-				mRunnables.push(std::move(aRunnable));
-			}
-			catch (...) {
-				return false;
-			}
-
-			return true;
-		}
-
-	private:
-		std::queue<Runnable> mRunnables;
-
-};
+		PdhGetFormattedCounterValue(cpuTotal, PDH_FMT_DOUBLE, NULL, &counterVal);
+		return counterVal.doubleValue;	
+	}
+}

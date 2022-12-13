@@ -3,6 +3,8 @@
 // are changed infrequently
 //
 
+#pragma comment(lib,"pdh.lib")
+
 #pragma once
 
 #include "targetver.h"
@@ -23,7 +25,8 @@
 #include <queue>
 #include <mutex>
 #include <intrin.h>
-#include "windows.h"
-
+#include <TCHAR.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 
 // TODO: reference additional headers your program requires here
