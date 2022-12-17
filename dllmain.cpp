@@ -4,6 +4,83 @@
 
 #include "CPUInfo.h"
 
+#include "timeapi.h"
+
+/* ========================================================================== */
+/* Time: */
+// extern "C"
+// BOOL WINAPI QueryProcessCycleTime(
+// 	HANDLE      hProcess,
+// 	PULONG64    CycleTime);
+
+// extern "C"
+// DWORD timeGetTime(void);
+
+/* ========================================================================== */
+/* Timer Functions: */
+// extern "C"
+// DWORD WINAPI GetTickCount(void);
+
+// extern "C"
+// ULONGLONG WINAPI GetTickCount64(void);
+
+// extern "C"
+// BOOL WINAPI QueryPerformanceFrequency(
+// 	LARGE_INTEGER* lpFrequency);
+// extern "C"
+// BOOL WINAPI QueryPerformanceCounter(
+// 	LARGE_INTEGER* lpPerformanceCount);
+
+extern "C"
+NTSYSAPI NTSTATUS NTAPI NtQueryTimerResolution(PULONG MinimumResolution,
+	PULONG MaximumResolution,
+	PULONG CurrentResolution);
+
+ULONG pGetSysTimerResolution() {
+	static HMODULE ntdll = LoadLibrary("ntdll.dll");
+	static auto QueryTimerResolution =
+		reinterpret_cast<decltype(&::NtQueryTimerResolution)>(
+			GetProcAddress(ntdll, "NtQueryTimerResolution"));
+	ULONG minimum, maximum, current;
+	QueryTimerResolution(&minimum, &maximum, &current);
+	return current;
+}
+
+ULONG pCurrentTimerResolution() {
+	ULONG minimum, maximum, current;
+	NtQueryTimerResolution(&minimum, &maximum, &current);
+	return current;
+}
+
+/* ========================================================================== */
+/* Multi Media Timer:                                                         */
+
+/* MMRESULT: */
+#define TIMERR_BASE           96
+#define TIMERR_NOERROR        (0)                  /* no error */
+#define TIMERR_NOCANDO        (TIMERR_BASE+1)      /* request not completed */
+#define TIMERR_STRUCT         (TIMERR_BASE+33)     /* time struct size */
+
+
+//typedef struct timecaps_tag {
+//	UINT    wPeriodMin;     /* minimum period supported  */
+//	UINT    wPeriodMax;     /* maximum period supported  */
+//} TIMECAPS, * PTIMECAPS, * NPTIMECAPS, * LPTIMECAPS;
+//typedef UINT MMRESULT;
+
+
+//extern "C"
+//MMRESULT WINAPI timeGetDevCaps(LPTIMECAPS ptc, UINT cbtc);
+
+//extern "C"
+//MMRESULT WINAPI timeBeginPeriod(UINT uPeriod);
+
+//extern "C"
+//MMRESULT WINAPI timeEndPeriod(UINT uPeriod);
+
+/* ========================================================================== */
+/* CpuSet:			                                                          */
+
 typedef enum _SYSTEM_INFORMATION_CLASS {
 	SystemAllowedCpuSetsInformation = 168,
 	SystemCpuSetInformation = 175,
@@ -17,6 +94,16 @@ typedef enum _PROCESSINFOCLASS {
 
 #define STATUS_ACCESS_DENIED ((NTSTATUS)0xC0000022L)
 #define STATUS_SUCCESS		 ((NTSTATUS)0)
+
+extern "C"
+NTSTATUS 
+RtlAdjustPrivilege
+(
+	ULONG    Privilege,
+	BOOLEAN  Enable,
+	BOOLEAN  CurrentThread,
+	PBOOLEAN Enabled
+);
 
 extern "C"
 NTSTATUS
@@ -71,6 +158,7 @@ NtQueryInformationProcess(
 );
 
 #pragma comment(lib, "ntdll")
+#pragma comment(lib, "winmm")
 
 const unsigned int HALF_ARRAY = 0x1FFFFFF + 1;
 const unsigned int ARRAY_SIZE = HALF_ARRAY * 2;
@@ -80,7 +168,6 @@ unsigned int* mem;
 typedef BOOL(WINAPI* LPFN_GLPI)(
 	PSYSTEM_LOGICAL_PROCESSOR_INFORMATION,
 	PDWORD);
-
 
 // TIME DIFF FUNC
 ULONGLONG SubtractTimes(const FILETIME one, const FILETIME two)
@@ -456,6 +543,23 @@ BOOL SetPrivilege(HANDLE hToken, PCTSTR lpszPrivilege, bool bEnablePrivilege) {
 	return TRUE;
 }
 
+std::vector<ULONG> BuildIdsFromMask(ULONG64* set, ULONG count) {
+	int index = 0x100;	// first set
+	std::vector<ULONG> ids;
+
+	for (ULONG i = 0; i < count; i++) {
+		auto mask = set[i];
+		while (mask) {
+			if (mask & 1)
+				ids.push_back(index);
+			index++;
+			mask >>= 1;
+		}
+	}
+	return ids;
+}
+
+
 template<typename T>
 //bool ParseCPUSet(T* pSet, const char* text, int& count) {
 bool ParseCPUSet(T* pSet, const UINT bitMask, int& count) {
@@ -516,13 +620,68 @@ extern "C"
 
 extern "C"
 {
+	__declspec(dllexport) int __stdcall ResetSystemCpuSetProc(UINT pid, UINT bitMask)
+	{
+		ULONG64 systemCpuSet[20];
+		int count = 0;
+		int _ret = 0;
+		HANDLE hToken = nullptr;
+		HANDLE hProcess = nullptr;
+		NTSTATUS status;
+
+		::OpenProcessToken(::GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
+
+		if (!SetPrivilege(hToken, SE_INC_BASE_PRIORITY_NAME, TRUE))
+			_ret = -1;
+		::CloseHandle(hToken);
+
+		if (_ret == 0) {
+			hProcess = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+			if (!hProcess) _ret = -2;
+		}
+
+		if (!ParseCPUSet(systemCpuSet, bitMask, count))
+			_ret = -2;
+
+		if (_ret == 0) {
+			auto pSet = systemCpuSet;
+
+			if (bitMask == 0) {
+				pSet = nullptr;
+				count = 0;
+			}
+
+			if (hProcess) {
+				if (pSet) {
+					auto ids = BuildIdsFromMask(pSet, count);
+					status = ::SetProcessDefaultCpuSets(hProcess, ids.data(), (ULONG)ids.size());
+				}
+				else {
+					status = ::SetProcessDefaultCpuSets(hProcess, nullptr, 0);
+				}
+
+				if (status == STATUS_SUCCESS)
+					_ret = 0;
+				else
+					_ret = (int)status;
+
+				::CloseHandle(hProcess);
+			}
+		}
+
+		return _ret;
+	}
+}
+
+extern "C"
+{
 	__declspec(dllexport) double __stdcall GetCpuTotalLoad()
 	{
 		static PDH_HQUERY cpuQuery;
 		static PDH_HCOUNTER cpuTotal;
 		PdhOpenQuery(NULL, NULL, &cpuQuery);
 		// You can also use L"\\Processor(*)\\% Processor Time" and get individual CPU values with PdhGetFormattedCounterArray()
-		PdhAddEnglishCounter(cpuQuery, L"\\Processor(_Total)\\% Processor Time", NULL, &cpuTotal);
+		PdhAddEnglishCounter(cpuQuery, "\\Processor(_Total)\\% Processor Time", NULL, &cpuTotal);
 		PdhCollectQueryData(cpuQuery);
 		PDH_FMT_COUNTERVALUE counterVal;
 		
@@ -532,5 +691,347 @@ extern "C"
 		
 		PdhGetFormattedCounterValue(cpuTotal, PDH_FMT_DOUBLE, NULL, &counterVal);
 		return counterVal.doubleValue;	
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) ULONG __stdcall GetSysTimerResolution() {
+	{
+			return pGetSysTimerResolution();
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) ULONG __stdcall GetTimerResolution() {
+		{
+			return pCurrentTimerResolution();
+		}
+	}
+}
+
+class Stopwatch {
+public:
+	Stopwatch() { QueryPerformanceCounter(&start_); }
+	// Return elapsed time in seconds.
+	double GetElapsed() {
+		LARGE_INTEGER end;
+		QueryPerformanceCounter(&end);
+		LARGE_INTEGER freq;
+		QueryPerformanceFrequency(&freq);
+		return static_cast<double>(end.QuadPart - start_.QuadPart) / freq.QuadPart;
+	}
+
+private:
+	LARGE_INTEGER start_;
+};
+
+DOUBLE usleep(HANDLE timer, LONGLONG duration_us, bool get_result) {
+	LARGE_INTEGER liDueTime;
+	// Convert from microseconds to 100 of ns, and negative for relative time.
+	liDueTime.QuadPart = -(duration_us * 10);
+
+	if (!SetWaitableTimer(timer, &liDueTime, 0, NULL, NULL, 0))
+		return -2;
+
+	Stopwatch stopwatch;
+	DWORD ret = WaitForSingleObject(timer, INFINITE);
+	if (ret != WAIT_OBJECT_0)
+		return -3;
+
+	if (!get_result) return 0;
+	
+	return stopwatch.GetElapsed() * 1e6;
+}
+
+extern "C"
+{
+	__declspec(dllexport) void __stdcall wsleep(LONGLONG duration_us) {
+		{
+			HANDLE timer =
+				CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+			if (timer == NULL)
+				return;
+			usleep(timer, duration_us, false);
+			CloseHandle(timer);
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) DOUBLE __stdcall testTimerOverall(LONGLONG duration_us) {
+		{
+			HANDLE timer =
+				CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+			if (timer == NULL)
+				return -1;
+			constexpr int kIterations = 10;
+			DOUBLE total = 0;
+			for (int i = 0; i < kIterations; ++i)
+				total += usleep(timer, duration_us, true);
+			CloseHandle(timer);
+			return total / kIterations;
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) DOUBLE __stdcall testTimerPerf(LONGLONG duration_us, INT kIterations, bool waitable) {
+		{
+			DWORD CreateFlag = 0;
+			if (waitable) CreateFlag = CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
+			HANDLE timer =
+				CreateWaitableTimerEx(NULL, NULL, CreateFlag, TIMER_ALL_ACCESS);
+			if (timer == NULL)
+				return -1;
+			Stopwatch stopwatch;
+			for (int i = 0; i < kIterations; ++i)
+				usleep(timer, duration_us, false);
+			DOUBLE result = stopwatch.GetElapsed();
+			CloseHandle(timer);
+			return result;
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) int __stdcall setPowerThrottlingIgnoreTimer(INT pid, bool enable) {
+		{
+			PROCESS_POWER_THROTTLING_STATE PowerThrottling;
+			RtlZeroMemory(&PowerThrottling, sizeof(PowerThrottling));
+			PowerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+			BOOLEAN bpriv;
+
+			int _ret = 0;
+			HANDLE hToken = nullptr;
+			HANDLE hProcess = nullptr;
+
+			::OpenProcessToken(::GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
+
+			if (!SetPrivilege(hToken, SE_DEBUG_NAME, TRUE))
+				_ret = -1;
+			if (RtlAdjustPrivilege(20L, TRUE, FALSE, &bpriv) != STATUS_SUCCESS)
+				_ret = -2;
+
+			if (_ret == 0) {
+				hProcess = ::OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+				if (!hProcess) _ret = -3;
+			}
+
+			//
+			// Always ignore or honor Timer Resolution Requests.
+			// Turn IGNORE_TIMER_RESOLUTION throttling off or on. 
+			// ControlMask selects the mechanism and StateMask declares which mechanism should be on or off (0).
+			//
+
+			if (hProcess != nullptr && _ret == 0) {
+				PowerThrottling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+				PowerThrottling.StateMask = 0;
+				if (enable) PowerThrottling.StateMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+
+				if (SetProcessInformation(hProcess,
+					ProcessPowerThrottling,
+					&PowerThrottling,
+					sizeof(PowerThrottling)) == 0) _ret = GetLastError();
+			}
+
+			::CloseHandle(hToken);
+			::CloseHandle(hProcess);
+
+			return _ret;
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) int __stdcall setPowerThrottlingExecSpeed(INT pid, bool enable) {
+		{
+			PROCESS_POWER_THROTTLING_STATE PowerThrottling;
+			RtlZeroMemory(&PowerThrottling, sizeof(PowerThrottling));
+			PowerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+			BOOLEAN bpriv;
+
+			int _ret = 0;
+			HANDLE hToken = nullptr;
+			HANDLE hProcess = nullptr;
+
+			::OpenProcessToken(::GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
+			
+			if (!SetPrivilege(hToken, SE_DEBUG_NAME, TRUE))
+				_ret = -1;
+			if (RtlAdjustPrivilege(20L, TRUE, FALSE, &bpriv) != STATUS_SUCCESS)
+				_ret = -2;
+
+			if (_ret == 0) {
+				hProcess = ::OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+				if (!hProcess) _ret = -3;
+			}
+
+			//
+			// HighQOS / EcoQoS
+			// Turn EXECUTION_SPEED throttling state. 
+			// ControlMask selects the mechanism and StateMask declares which mechanism should be on (EcoQoS) or off (0 = HighQoS).
+			//
+
+			if (hProcess != nullptr && _ret == 0) {
+				PowerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+				PowerThrottling.StateMask = 0;
+				if (enable) PowerThrottling.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+
+				if (SetProcessInformation(hProcess,
+					ProcessPowerThrottling,
+					&PowerThrottling,
+					sizeof(PowerThrottling)) == 0) _ret = GetLastError();
+			}
+
+			::CloseHandle(hToken);
+			::CloseHandle(hProcess);
+
+			return _ret;
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) int __stdcall resetPowerThrottling(INT pid) {
+		{
+			PROCESS_POWER_THROTTLING_STATE PowerThrottling;
+			RtlZeroMemory(&PowerThrottling, sizeof(PowerThrottling));
+			PowerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+			BOOLEAN bpriv;
+
+			int _ret = 0;
+			HANDLE hToken = nullptr;
+			HANDLE hProcess = nullptr;
+
+			::OpenProcessToken(::GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
+
+			if (!SetPrivilege(hToken, SE_DEBUG_NAME, TRUE))
+				_ret = -1;
+			if (RtlAdjustPrivilege(20L, TRUE, FALSE, &bpriv) != STATUS_SUCCESS)
+				_ret = -2;
+
+			if (_ret == 0) {
+				hProcess = ::OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+				if (!hProcess) _ret = -3;
+			}
+
+			//
+			// Let system manage all power throttling. ControlMask is set to 0 as we don’t want 
+			// to control any mechanisms.
+			//
+
+			if (hProcess != nullptr && _ret == 0) {
+				PowerThrottling.ControlMask = 0;
+				PowerThrottling.StateMask = 0;
+
+				if (!SetProcessInformation(hProcess,
+					ProcessPowerThrottling,
+					&PowerThrottling,
+					sizeof(PowerThrottling))) _ret = GetLastError();
+			}
+
+			::CloseHandle(hToken);
+			::CloseHandle(hProcess);
+
+			return _ret;
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) int __stdcall setMemPrio(INT pid, MEMORY_PRIORITY_INFORMATION MemPrio) {
+		{
+			BOOL Success;
+			BOOLEAN bpriv;
+
+			int _ret = 0;
+			HANDLE hToken = nullptr;
+			HANDLE hProcess = nullptr;
+
+			::OpenProcessToken(::GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
+
+			if (!SetPrivilege(hToken, SE_DEBUG_NAME, TRUE))
+				_ret = -1;
+			if (RtlAdjustPrivilege(20L, TRUE, FALSE, &bpriv) != STATUS_SUCCESS)
+				_ret = -2;
+
+			if (_ret == 0) {
+				hProcess = ::OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+				if (!hProcess) _ret = -2;
+			}
+
+			if (hProcess != nullptr && _ret == 0) {
+				ZeroMemory(&MemPrio, sizeof(MemPrio));
+				MemPrio.MemoryPriority = MEMORY_PRIORITY_LOW;
+
+				Success = SetProcessInformation(hProcess,
+					ProcessMemoryPriority,
+					&MemPrio,
+					sizeof(MemPrio));
+
+				if (!Success)
+					_ret = GetLastError();
+			}
+
+			::CloseHandle(hToken);
+			::CloseHandle(hProcess);
+
+			return _ret;
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) bool __stdcall setTimeBeginPeriod(INT period) {
+		{
+			MMRESULT result;
+
+			result = timeBeginPeriod(period);
+
+			if (result == TIMERR_NOCANDO) return false;
+
+			return true;
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) bool __stdcall setTimeEndPeriod(INT period) {
+		{
+			MMRESULT result;
+
+			result = timeEndPeriod(period);
+
+			if (result == TIMERR_NOCANDO) return false;
+
+			return true;
+		}
+	}
+}
+
+extern "C"
+{
+	__declspec(dllexport) bool __stdcall TimeGetDevCaps(LPTIMECAPS ptc) {
+		{
+			MMRESULT result;
+			RtlZeroMemory(&ptc, sizeof(ptc));
+
+			result = timeGetDevCaps(ptc, sizeof(ptc));
+
+			if (result == TIMERR_NOCANDO) return false;
+
+			return true;
+		}
 	}
 }
